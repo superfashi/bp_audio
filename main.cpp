@@ -1,6 +1,8 @@
 #include <QDir>
+#include <QHash>
 #include <QtDebug>
 #include <QUrlQuery>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonDocument>
 #include <QNetworkReply>
@@ -19,12 +21,41 @@
 
 #include <Shlobj.h>
 
+class PictureWrapper {
+    TagLib::String mime_type;
+    TagLib::FLAC::Picture::Type t;
+    TagLib::ByteVector bv;
+public:
+    PictureWrapper(const TagLib::String &mime,
+                   const TagLib::FLAC::Picture::Type &type,
+                   const QByteArray &byte):
+        mime_type(mime),
+        t(type),
+        bv(byte.data(), byte.length()) {}
+
+    PictureWrapper(QNetworkReply *resp) {
+        const QByteArray &bin = resp->readAll();
+        bv = TagLib::ByteVector(bin.data(), bin.length());
+        mime_type = resp->header(QNetworkRequest::ContentTypeHeader).toString().toStdString();
+        t = TagLib::FLAC::Picture::FrontCover;
+    }
+
+    TagLib::FLAC::Picture *get_pic() {
+        TagLib::FLAC::Picture *pic = new TagLib::FLAC::Picture();
+        pic->setMimeType(mime_type);
+        pic->setType(t);
+        pic->setData(bv);
+        return pic;
+    }
+};
+
 QCommandLineOption au_opt({"a", "au"}, "Audio AU number.", "au");
 QCommandLineOption all_opt("menu", "Download whole menu.");
 QCommandLineOption output_opt({"o", "out"}, "Output folder path.", "path");
 QCommandLineParser parser;
 QScopedPointer<QNetworkAccessManager> session;
 QDir output;
+QHash<QString, QSharedPointer<PictureWrapper>> assets;
 
 QString find_audio(const QByteArray &data) {
     CDocument doc;
@@ -33,8 +64,9 @@ QString find_audio(const QByteArray &data) {
     return QString::fromStdString(audio.nodeAt(0).attribute("src"));
 }
 
-void write_metadata(const QString &file, const QJsonObject &data) {
-    TagLib::FLAC::File f(qPrintable(file));
+void write_metadata(const QString &file, const QJsonObject &data,
+                    const int &track, const int &total) {
+    TagLib::FLAC::File f(TagLib::FileName(file.toStdWString().data()));
     if (!f.isValid()) {
         qCritical("Downloaded song not valid");
         std::exit(EXIT_FAILURE);
@@ -52,59 +84,62 @@ void write_metadata(const QString &file, const QJsonObject &data) {
             map.insert("ALBUM", TagLib::String(album_menu["title"].toString().toStdWString()));
             map.insert("DATE", TagLib::String(QDateTime::fromTime_t(album_menu["pubTime"].toInt()).toString("yyyy-MM-dd").toStdWString()));
             map.insert("LABEL", TagLib::String(album_menu["publisher"].toString().toStdWString()));
+            map.insert("DISCNUMBER", TagLib::String(QString::number(1).toStdWString()));
+            map.insert("DISCTOTAL", TagLib::String(QString::number(1).toStdWString()));
         }
+    }
+    if (track != -1 && total != -1) {
+        map.insert("TRACKNUMBER", TagLib::String(QString::number(track).toStdWString()));
+        map.insert("TRACKTOTAL", TagLib::String(QString::number(total).toStdWString()));
     }
     f.xiphComment(true)->setProperties(map);
 
-    QNetworkRequest cover_req(QUrl(data["cover_url"].toString()));
-    QScopedPointer<QNetworkReply> cover_resp(session->get(cover_req));
-    qInfo("Getting album art...");
-    QEventLoop loop;
-    QObject::connect(cover_resp.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    loop.exec();
+    const QString &cover_url = data["cover_url"].toString();
 
-    const QByteArray &cover_bin = cover_resp->readAll();
+    QSharedPointer<PictureWrapper> w;
+    if (assets.count(cover_url)) {
+        w = assets[cover_url];
+    } else {
+        QNetworkRequest cover_req(QUrl(data["cover_url"].toString()));
+        QScopedPointer<QNetworkReply> cover_resp(session->get(cover_req));
+        qInfo("Getting album art...");
+        QEventLoop loop;
+        QObject::connect(cover_resp.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
+        loop.exec();
 
-    TagLib::ByteVector bv(cover_bin.data(), cover_bin.length());
-    TagLib::FLAC::Picture pic;
-    pic.setMimeType(cover_resp->header(QNetworkRequest::ContentTypeHeader).toString().toStdString());
-    pic.setType(TagLib::FLAC::Picture::FrontCover);
-    pic.setData(bv);
-    f.addPicture(&pic);
+        if (cover_resp->error() != QNetworkReply::NoError) {
+            qCritical("Error loading album art");
+            qDebug("  %s", qUtf8Printable(cover_resp->errorString()));
+            std::exit(EXIT_FAILURE);
+        }
+        w.reset(new PictureWrapper(cover_resp.data()));
+        assets.insert(cover_url, w);
+    }
 
+    f.addPicture(w->get_pic());
     f.save();
 }
 
-void get_song_info(const QString &au)
-{
-    QNetworkRequest song_info_req(QUrl("https://www.bilibili.com/audio/music-service-c/songs/playing?song_id=" + au));
-    QScopedPointer<QNetworkReply> info(session->get(song_info_req));
-
-    qInfo("Start loading song info for %s...", qUtf8Printable(au));
-    QEventLoop loop;
-    QObject::connect(info.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    loop.exec();
-
-    const QJsonDocument &doc = QJsonDocument::fromJson(info->readAll());
-    const QJsonObject &obj = doc.object();
-    if (obj["code"].toInt() != 0) {
-        qCritical("Error loading song info");
-        qDebug("  %d: %s", obj["code"].toInt(), qUtf8Printable(obj["msg"].toString()));
-        std::exit(EXIT_FAILURE);
-    }
-
-    const QJsonObject &data = obj["data"].toObject();
+void download_song(const QJsonObject &data, const int &track = -1, const int &total = -1) {
     QString file_name = QStringLiteral("%1 - %2.flac").arg(data["author"].toString(), data["title"].toString());
     std::array<wchar_t, MAX_PATH> buf{};
     file_name.toWCharArray(buf.data());
     PathCleanupSpec(NULL, buf.data());
     file_name = QString::fromWCharArray(buf.data());
 
+    const QString &au = QString::number(data["id"].toInt());
     qInfo("Getting audio preview for %s...", qUtf8Printable(au));
     QNetworkRequest song_link_req(QUrl("https://m.bilibili.com/audio/au" + au));
     QScopedPointer<QNetworkReply> link_page(session->get(song_link_req));
+    QEventLoop loop;
     QObject::connect(link_page.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
     loop.exec();
+
+    if (link_page->error() != QNetworkReply::NoError) {
+        qCritical("Error loading audio preview");
+        qDebug("  %s", qUtf8Printable(link_page->errorString()));
+        std::exit(EXIT_FAILURE);
+    }
 
     const QString &audio_src = find_audio(link_page->readAll());
     QUrl audio_url(audio_src);
@@ -122,6 +157,12 @@ void get_song_info(const QString &au)
     QObject::connect(song_res.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
     loop.exec();
 
+    if (song_res->error() != QNetworkReply::NoError) {
+        qCritical("Error loading audio resource");
+        qDebug("  %s", qUtf8Printable(song_res->errorString()));
+        std::exit(EXIT_FAILURE);
+    }
+
     qInfo("Writing to %s...", qUtf8Printable(file_name));
     file_name = output.filePath(file_name);
     QFile f(file_name);
@@ -129,8 +170,91 @@ void get_song_info(const QString &au)
         f.write(song_res->readAll());
         f.close();
     }
-    write_metadata(file_name, data);
+    write_metadata(file_name, data, track, total);
     qInfo("Finished for %s...", qUtf8Printable(file_name));
+}
+
+void get_menu_info(const QString &menuid) {
+    QNetworkRequest menu_info_req(QUrl("https://www.bilibili.com/audio/music-service-c/menus/" + menuid));
+    QScopedPointer<QNetworkReply> info(session->get(menu_info_req));
+
+    qInfo("Start loading menu info for %s...", qUtf8Printable(menuid));
+    QEventLoop loop;
+    QObject::connect(info.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    loop.exec();
+
+    if (info->error() != QNetworkReply::NoError) {
+        qCritical("Error loading menu info");
+        qDebug("  %s", qUtf8Printable(info->errorString()));
+        std::exit(EXIT_FAILURE);
+    }
+
+    const QJsonDocument &doc = QJsonDocument::fromJson(info->readAll());
+    const QJsonObject &obj = doc.object();
+
+    if (obj["code"].toInt() != 0) {
+        qCritical("Error loading menu info");
+        qDebug("  %d: %s", obj["code"].toInt(), qUtf8Printable(obj["msg"].toString()));
+        std::exit(EXIT_FAILURE);
+    }
+
+    const QJsonObject &data = obj["data"].toObject();
+
+    const QJsonObject &menus_response = data["menusRespones"].toObject();
+    QString folder_name = QStringLiteral("%1 - %2").arg(menus_response["mbnames"].toString(), menus_response["title"].toString());
+    std::array<wchar_t, MAX_PATH> buf{};
+    folder_name.toWCharArray(buf.data());
+    PathCleanupSpec(NULL, buf.data());
+    folder_name = QString::fromWCharArray(buf.data());
+    output.mkdir(folder_name);
+    output.cd(folder_name);
+
+    const QJsonArray &songsList = data["songsList"].toArray();
+    int counter = 0;
+    const int &total = songsList.size();
+    for (const auto &&i : songsList) {
+        download_song(i.toObject(), ++counter, total);
+    }
+}
+
+void get_song_info(const QString &au)
+{
+    QNetworkRequest song_info_req(QUrl("https://www.bilibili.com/audio/music-service-c/songs/playing?song_id=" + au));
+    QScopedPointer<QNetworkReply> info(session->get(song_info_req));
+
+    qInfo("Start loading song info for %s...", qUtf8Printable(au));
+    QEventLoop loop;
+    QObject::connect(info.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    loop.exec();
+
+    if (info->error() != QNetworkReply::NoError) {
+        qCritical("Error loading song info");
+        qDebug("  %s", qUtf8Printable(info->errorString()));
+        std::exit(EXIT_FAILURE);
+    }
+
+    const QJsonDocument &doc = QJsonDocument::fromJson(info->readAll());
+    const QJsonObject &obj = doc.object();
+    if (obj["code"].toInt() != 0) {
+        qCritical("Error loading song info");
+        qDebug("  %d: %s", obj["code"].toInt(), qUtf8Printable(obj["msg"].toString()));
+        std::exit(EXIT_FAILURE);
+    }
+
+    const QJsonObject &data = obj["data"].toObject();
+    if (parser.isSet(all_opt)) {
+        const auto &album_info = data.find("pgc_info");
+        if (album_info != data.end()) {
+            const QJsonObject &album_info_obj = album_info->toObject();
+            if (album_info_obj.find("pgc_menu") != album_info_obj.end()) {
+                const QJsonObject &album_menu = album_info_obj["pgc_menu"].toObject();
+                get_menu_info(QString::number(album_menu["menuId"].toInt()));
+                return;
+            }
+        }
+        qDebug("No menu found.");
+    }
+    download_song(data);
 }
 
 int main(int argc, char *argv[])
