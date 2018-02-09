@@ -1,11 +1,10 @@
 #include <QDir>
 #include <QtDebug>
-#include <QDomNode>
 #include <QUrlQuery>
 #include <QJsonObject>
-#include <QDomDocument>
 #include <QJsonDocument>
 #include <QNetworkReply>
+#include <QScopedPointer>
 #include <QCoreApplication>
 #include <QCommandLineOption>
 #include <QCommandLineParser>
@@ -20,13 +19,11 @@
 
 #include <Shlobj.h>
 
-#include <cassert>
-
 QCommandLineOption au_opt({"a", "au"}, "Audio AU number.", "au");
 QCommandLineOption all_opt("menu", "Download whole menu.");
 QCommandLineOption output_opt({"o", "out"}, "Output folder path.", "path");
 QCommandLineParser parser;
-QNetworkAccessManager *session;
+QScopedPointer<QNetworkAccessManager> session;
 QDir output;
 
 QString find_audio(const QByteArray &data) {
@@ -60,14 +57,13 @@ void write_metadata(const QString &file, const QJsonObject &data) {
     f.xiphComment(true)->setProperties(map);
 
     QNetworkRequest cover_req(QUrl(data["cover_url"].toString()));
-    QNetworkReply *cover_resp = session->get(cover_req);
+    QScopedPointer<QNetworkReply> cover_resp(session->get(cover_req));
     qInfo("Getting album art...");
     QEventLoop loop;
-    QObject::connect(cover_resp, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    QObject::connect(cover_resp.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
     loop.exec();
 
     const QByteArray &cover_bin = cover_resp->readAll();
-    cover_resp->deleteLater();
 
     TagLib::ByteVector bv(cover_bin.data(), cover_bin.length());
     TagLib::FLAC::Picture pic;
@@ -82,15 +78,14 @@ void write_metadata(const QString &file, const QJsonObject &data) {
 void get_song_info(const QString &au)
 {
     QNetworkRequest song_info_req(QUrl("https://www.bilibili.com/audio/music-service-c/songs/playing?song_id=" + au));
-    QNetworkReply *info = session->get(song_info_req);
+    QScopedPointer<QNetworkReply> info(session->get(song_info_req));
 
     qInfo("Start loading song info for %s...", qUtf8Printable(au));
     QEventLoop loop;
-    QObject::connect(info, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    QObject::connect(info.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
     loop.exec();
 
     const QJsonDocument &doc = QJsonDocument::fromJson(info->readAll());
-    info->deleteLater();
     const QJsonObject &obj = doc.object();
     if (obj["code"].toInt() != 0) {
         qCritical("Error loading song info");
@@ -107,12 +102,11 @@ void get_song_info(const QString &au)
 
     qInfo("Getting audio preview for %s...", qUtf8Printable(au));
     QNetworkRequest song_link_req(QUrl("https://m.bilibili.com/audio/au" + au));
-    QNetworkReply *link_page = session->get(song_link_req);
-    QObject::connect(link_page, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    QScopedPointer<QNetworkReply> link_page(session->get(song_link_req));
+    QObject::connect(link_page.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
     loop.exec();
 
     const QString &audio_src = find_audio(link_page->readAll());
-    link_page->deleteLater();
     QUrl audio_url(audio_src);
 
     QString audio_path = audio_url.path();
@@ -124,8 +118,8 @@ void get_song_info(const QString &au)
     audio_url.setQuery(QUrlQuery());
 
     QNetworkRequest song_flac(audio_url);
-    QNetworkReply *song_res = session->get(song_flac);
-    QObject::connect(song_res, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    QScopedPointer<QNetworkReply> song_res(session->get(song_flac));
+    QObject::connect(song_res.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
     loop.exec();
 
     qInfo("Writing to %s...", qUtf8Printable(file_name));
@@ -135,7 +129,6 @@ void get_song_info(const QString &au)
         f.write(song_res->readAll());
         f.close();
     }
-    song_res->deleteLater();
     write_metadata(file_name, data);
     qInfo("Finished for %s...", qUtf8Printable(file_name));
 }
@@ -144,7 +137,7 @@ int main(int argc, char *argv[])
 {
     QCoreApplication a(argc, argv);
 
-    session = new QNetworkAccessManager(&a);
+    session.reset(new QNetworkAccessManager());
 
     parser.addOption(au_opt);
     parser.addOption(all_opt);
