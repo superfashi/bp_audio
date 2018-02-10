@@ -49,19 +49,36 @@ public:
     }
 };
 
+const int bar_width = 50;
+const QString app_name = "bp_audio";
+const QString app_version = "1.0";
+
 QCommandLineOption au_opt({"a", "au"}, "Audio AU number.", "au");
 QCommandLineOption all_opt("menu", "Download whole menu.");
 QCommandLineOption output_opt({"o", "out"}, "Output folder path.", "path");
 QCommandLineParser parser;
 QScopedPointer<QNetworkAccessManager> session;
 QDir output;
-QHash<QString, QSharedPointer<PictureWrapper>> assets;
+QHash<QString, QSharedPointer<PictureWrapper> > assets;
 
 QString find_audio(const QByteArray &data) {
     CDocument doc;
     doc.parse(data.toStdString());
     CSelection audio = doc.find("audio");
     return QString::fromStdString(audio.nodeAt(0).attribute("src"));
+}
+
+void download_progress(const qint64 &bytes_received, const qint64 &bytes_total) {
+    if (bytes_total == -1) return;
+    std::cerr << '[';
+    int pos = bar_width * bytes_received / bytes_total;
+    for (int i = 0; i < bar_width; ++i) {
+        if (i < pos) std::cerr << '=';
+        else if (i == pos) std::cerr << '>';
+        else std::cerr << ' ';
+    }
+    std::cerr << "] " << int(100 * bytes_received / bytes_total) << " %\r";
+    if (bytes_received >= bytes_total) std::cerr << '\n';
 }
 
 void write_metadata(const QString &file, const QJsonObject &data,
@@ -124,7 +141,7 @@ void download_song(const QJsonObject &data, const int &track = -1, const int &to
     QString file_name = QStringLiteral("%1 - %2.flac").arg(data["author"].toString(), data["title"].toString());
     std::array<wchar_t, MAX_PATH> buf{};
     file_name.toWCharArray(buf.data());
-    PathCleanupSpec(NULL, buf.data());
+    PathCleanupSpec(output.absolutePath().toStdWString().data(), buf.data());
     file_name = QString::fromWCharArray(buf.data());
 
     const QString &au = QString::number(data["id"].toInt());
@@ -154,24 +171,27 @@ void download_song(const QJsonObject &data, const int &track = -1, const int &to
 
     QNetworkRequest song_flac(audio_url);
     QScopedPointer<QNetworkReply> song_res(session->get(song_flac));
+    QObject::connect(song_res.data(), &QNetworkReply::downloadProgress, download_progress);
+    QObject::connect(song_res.data(), &QNetworkReply::readyRead, &loop, &QEventLoop::quit);
     QObject::connect(song_res.data(), &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    loop.exec();
 
-    if (song_res->error() != QNetworkReply::NoError) {
-        qCritical("Error loading audio resource");
-        qDebug("  %s", qUtf8Printable(song_res->errorString()));
-        std::exit(EXIT_FAILURE);
-    }
-
-    qInfo("Writing to %s...", qUtf8Printable(file_name));
     file_name = output.filePath(file_name);
+    qInfo("Writing to %s...", qUtf8Printable(file_name));
     QFile f(file_name);
     if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        f.write(song_res->readAll());
+        do {
+            loop.exec();
+            if (song_res->error() != QNetworkReply::NoError) {
+                qCritical("Error loading audio resource");
+                qDebug("  %s", qUtf8Printable(song_res->errorString()));
+                std::exit(EXIT_FAILURE);
+            }
+            f.write(song_res->readAll());
+        } while (!song_res->isFinished());
         f.close();
     }
     write_metadata(file_name, data, track, total);
-    qInfo("Finished for %s...", qUtf8Printable(file_name));
+    qInfo("Finished for %s", qUtf8Printable(file_name));
 }
 
 void get_menu_info(const QString &menuid) {
@@ -204,7 +224,7 @@ void get_menu_info(const QString &menuid) {
     QString folder_name = QStringLiteral("%1 - %2").arg(menus_response["mbnames"].toString(), menus_response["title"].toString());
     std::array<wchar_t, MAX_PATH> buf{};
     folder_name.toWCharArray(buf.data());
-    PathCleanupSpec(NULL, buf.data());
+    PathCleanupSpec(output.absolutePath().toStdWString().data(), buf.data());
     folder_name = QString::fromWCharArray(buf.data());
     output.mkdir(folder_name);
     output.cd(folder_name);
@@ -260,6 +280,8 @@ void get_song_info(const QString &au)
 int main(int argc, char *argv[])
 {
     QCoreApplication a(argc, argv);
+    a.setApplicationName(app_name);
+    a.setApplicationVersion(app_version);
 
     session.reset(new QNetworkAccessManager());
 
@@ -267,7 +289,8 @@ int main(int argc, char *argv[])
     parser.addOption(all_opt);
     parser.addOption(output_opt);
     parser.addHelpOption();
-    parser.setApplicationDescription("Free bili lossless audio.");
+    parser.addVersionOption();
+    parser.setApplicationDescription("Get to know some free official FLAC music.");
     parser.process(a);
 
     const QString &au_number = parser.value(au_opt);
