@@ -19,20 +19,13 @@
 #include <gumbo-query/Document.h>
 #include <gumbo-query/Node.h>
 
-#include <Shlobj.h>
+#include "file_stream.cpp"
 
 class PictureWrapper {
     TagLib::String mime_type;
     TagLib::FLAC::Picture::Type t;
     TagLib::ByteVector bv;
 public:
-    PictureWrapper(const TagLib::String &mime,
-                   const TagLib::FLAC::Picture::Type &type,
-                   const QByteArray &byte):
-        mime_type(mime),
-        t(type),
-        bv(byte.data(), byte.length()) {}
-
     PictureWrapper(QNetworkReply *resp) {
         const QByteArray &bin = resp->readAll();
         bv = TagLib::ByteVector(bin.data(), bin.length());
@@ -51,7 +44,7 @@ public:
 
 const int bar_width = 50;
 const QString app_name = "bp_audio";
-const QString app_version = "1.0";
+const QString app_version = "1.1";
 
 QCommandLineOption au_opt({"a", "au"}, "Audio AU number.", "au");
 QCommandLineOption all_opt("menu", "Download whole menu.");
@@ -61,11 +54,26 @@ QScopedPointer<QNetworkAccessManager> session;
 QDir output;
 QHash<QString, QSharedPointer<PictureWrapper> > assets;
 
+#ifdef _WIN32
+#include <Shlobj.h>
+
+QString santize_filename(const QString &name) {
+    std::array<wchar_t, MAX_PATH> buf{};
+    name.toWCharArray(buf.data());
+    PathCleanupSpec(output.absolutePath().toStdWString().data(), buf.data());
+    return std::move(QString::fromWCharArray(buf.data()));
+}
+#else
+QString santize_filename(const QString &name) {
+    return name; // Yeah'em lazy.
+}
+#endif
+
 QString find_audio(const QByteArray &data) {
     CDocument doc;
     doc.parse(data.toStdString());
     CSelection audio = doc.find("audio");
-    return QString::fromStdString(audio.nodeAt(0).attribute("src"));
+    return std::move(QString::fromStdString(audio.nodeAt(0).attribute("src")));
 }
 
 void download_progress(const qint64 &bytes_received, const qint64 &bytes_total) {
@@ -81,9 +89,9 @@ void download_progress(const qint64 &bytes_received, const qint64 &bytes_total) 
     if (bytes_received >= bytes_total) std::cerr << '\n';
 }
 
-void write_metadata(const QString &file, const QJsonObject &data,
+void write_metadata(QFile *file, const QJsonObject &data,
                     const int &track, const int &total) {
-    TagLib::FLAC::File f(TagLib::FileName(file.toStdWString().data()));
+    TagLib::FLAC::File f(new FileStream(file), nullptr);
     if (!f.isValid()) {
         qCritical("Downloaded song not valid");
         std::exit(EXIT_FAILURE);
@@ -139,10 +147,7 @@ void write_metadata(const QString &file, const QJsonObject &data,
 
 void download_song(const QJsonObject &data, const int &track = -1, const int &total = -1) {
     QString file_name = QStringLiteral("%1 - %2.flac").arg(data["author"].toString(), data["title"].toString());
-    std::array<wchar_t, MAX_PATH> buf{};
-    file_name.toWCharArray(buf.data());
-    PathCleanupSpec(output.absolutePath().toStdWString().data(), buf.data());
-    file_name = QString::fromWCharArray(buf.data());
+    file_name = santize_filename(file_name);
 
     const QString &au = QString::number(data["id"].toInt());
     qInfo("Getting audio preview for %s...", qUtf8Printable(au));
@@ -178,7 +183,7 @@ void download_song(const QJsonObject &data, const int &track = -1, const int &to
     file_name = output.filePath(file_name);
     qInfo("Writing to %s...", qUtf8Printable(file_name));
     QFile f(file_name);
-    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    if (f.open(QIODevice::ReadWrite | QIODevice::Truncate)) {
         do {
             loop.exec();
             if (song_res->error() != QNetworkReply::NoError) {
@@ -188,9 +193,9 @@ void download_song(const QJsonObject &data, const int &track = -1, const int &to
             }
             f.write(song_res->readAll());
         } while (!song_res->isFinished());
-        f.close();
     }
-    write_metadata(file_name, data, track, total);
+    write_metadata(&f, data, track, total);
+    f.close();
     qInfo("Finished for %s", qUtf8Printable(file_name));
 }
 
@@ -222,11 +227,11 @@ void get_menu_info(const QString &menuid) {
 
     const QJsonObject &menus_response = data["menusRespones"].toObject();
     QString folder_name = QStringLiteral("%1 - %2").arg(menus_response["mbnames"].toString(), menus_response["title"].toString());
-    std::array<wchar_t, MAX_PATH> buf{};
-    folder_name.toWCharArray(buf.data());
-    PathCleanupSpec(output.absolutePath().toStdWString().data(), buf.data());
-    folder_name = QString::fromWCharArray(buf.data());
-    output.mkdir(folder_name);
+    folder_name = santize_filename(folder_name);
+    if (!output.exists(folder_name) && !output.mkdir(folder_name)) {
+        qCritical("Error creating folder -- check permission");
+        std::exit(EXIT_FAILURE);
+    }
     output.cd(folder_name);
 
     const QJsonArray &songsList = data["songsList"].toArray();
