@@ -1,18 +1,18 @@
 # bp_audio
 **bp** stands for **bilibili ported**, but also **bai piao**.
 
-![banner](https://superfashi.b0.upaiyun.com/wp-content/uploads/2018/02/banner-bp-audio.png)
+![banner](https://www.superfashi.com/wp-content/uploads/2018/02/banner-bp-audio.png)
 
 An out-of-the-box extractor for Bilibili's official FLAC music.
 
 It can download Bilibili-purchased music in *SQ* (aka lossless) version without an account whatsoever. While downloading, it can also acquire music's metadata, including album art. It can also download the whole *menu* (aka album) at one time.
 
 # Example
-![Example-GIF](https://superfashi.b0.upaiyun.com/wp-content/uploads/2018/02/bp_example.gif)
+![Example-GIF](https://www.superfashi.com/wp-content/uploads/2018/02/bp_example.gif)
 
 With metadata included:
 
-![Example-Meta](https://superfashi.b0.upaiyun.com/wp-content/uploads/2018/02/bp_example.png)
+![Example-Meta](https://www.superfashi.com/wp-content/uploads/2018/02/bp_example.png)
 
 Try running this command on your own computer.
 
